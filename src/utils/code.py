@@ -98,8 +98,6 @@ def load_model(checkpoint_path: str | Path | None = None) -> None:
     """
     global _model, _params
 
-    if _model is not None:
-        return  # already loaded
 
     _patch_tf_webp()
 
