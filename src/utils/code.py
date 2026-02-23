@@ -911,6 +911,25 @@ def get_video_embeddings(
     def _jit_video_forward(params, video_input):
         return model.get_adapted_video_embeddings(params, video_input, train=False)
 
+    # ---------------------------------------------------------------------------
+    # malloc_trim helper
+    #
+    # Claude suggested this, apparently it can help reduce RAM usage by returning freed memory to the OS instead of keeping it in the Python process heap.  It's a no-op if malloc_trim isn't available (e.g. on Windows).
+    # ---------------------------------------------------------------------------
+    try:
+        import ctypes as _ctypes
+
+        _libc = _ctypes.CDLL(None)
+        _malloc_trim = _libc.malloc_trim
+        _malloc_trim.restype = _ctypes.c_int
+        _malloc_trim.argtypes = [_ctypes.c_size_t]
+    except Exception:
+        _malloc_trim = None
+
+    def _trim_heap() -> None:
+        if _malloc_trim is not None:
+            _malloc_trim(0)
+
     def _flush_batch(
         pending_tensors: list[torch.Tensor],
         pending_labels: list[str],
@@ -930,12 +949,14 @@ def get_video_embeddings(
         gc.collect()
 
         v_emb = _jit_video_forward(params, video_input)
+        jax.block_until_ready(v_emb)
         emb_list.append(np.asarray(l2_normalize(v_emb.astype(jnp.float32))))
         labels.extend(pending_labels)
         del pending_labels[:]
 
         del video_input, v_emb
         gc.collect()
+        _trim_heap()
 
         return flushed
 
@@ -950,11 +971,12 @@ def get_video_embeddings(
         try:
             if is_interval:
                 local_rng = random.Random(seed + task_idx)
+                # switch to decord decoding to avoid buffering the entire video
                 video_tensor, _meta = decode(
                     str(vf),
                     num_frames,
                     resolution,
-                    decode_method="pyav",
+                    decode_method="decord",
                     resize_method="center_crop_resize",
                     frame_sampling_method="interval",
                     output_range="unit",
@@ -967,7 +989,7 @@ def get_video_embeddings(
                     str(vf),
                     num_frames,
                     resolution,
-                    decode_method="pyav",
+                    decode_method="decord",
                     resize_method="center_crop_resize",
                     frame_sampling_method="max_stride",
                     output_range="unit",
@@ -1078,6 +1100,8 @@ def get_video_embeddings(
                         _log(f"  WARNING: failed decode for {label}: {err}")
                     continue
                 decode_results.append((task_idx, label, is_interval, tensor))
+                gc.collect()
+                _trim_heap()
     else:
         for task in _progress_iter(decode_tasks, total=len(decode_tasks), desc="Decoding clips", unit="clip"):
             task_idx, label, is_interval, tensor, err = _decode_worker(task)
@@ -1089,6 +1113,8 @@ def get_video_embeddings(
                     _log(f"  WARNING: failed decode for {label}: {err}")
                 continue
             decode_results.append((task_idx, label, is_interval, tensor))
+            gc.collect()
+            _trim_heap()
 
     if not decode_results:
         raise RuntimeError(
@@ -1129,6 +1155,9 @@ def get_video_embeddings(
         )
 
     embeddings = jnp.asarray(np.concatenate(emb_list, axis=0))
+    # Free the per-batch numpy arrays now that they are concatenated.
+    del emb_list
+    gc.collect()
 
     if npz_filepath is not None:
         _save_path = Path(npz_filepath).expanduser().resolve()
@@ -1374,6 +1403,8 @@ def get_text_embeddings(
         gc.collect()
 
     embeddings = jnp.asarray(np.concatenate(emb_list, axis=0))
+    del emb_list
+    gc.collect()
 
     if npz_filepath is not None:
         _save_path = Path(npz_filepath).expanduser().resolve()
